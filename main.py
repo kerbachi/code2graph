@@ -1,57 +1,115 @@
-import re
+"""Load a Python codebase's dependency graph into Neo4j (for RAG / code onboarding).
+
+Usage:
+    python main.py [path_to_project]        # defaults to current directory
+
+Env vars (all optional):
+    NEO4J_URI        default neo4j://localhost:7687
+    NEO4J_USER       default neo4j
+    NEO4J_PASSWORD   default password
+
+Note: only *absolute* imports are captured (`import x` / `from x import y`).
+Relative imports (`from . import x`) are intentionally skipped to keep this
+small - extend extract_graph() if your codebase relies on them.
+"""
+import ast
+import os
+import sys
 from pathlib import Path
+
 from neo4j import GraphDatabase
 
-#URI = "neo4j+s://your-instance.databases.neo4j.io"
-URI = "neo4j://localhost:7687"
-AUTH = ("neo4j", "password")
-
-driver = GraphDatabase.driver(URI, auth=AUTH)
-
-def extract_module_dependencies(project_root: str) -> list[tuple[str, str]]:
-    """Extract (module, dependency) pairs from Python imports."""
-    edges = []
-    for py_file in Path(project_root).rglob("*.py"):
-        with open(py_file) as f:
-            content = f.read()
-        imports = re.findall(r"^import ([\w\.]+)", content, re.MULTILINE)
-        imports += re.findall(r"^from ([\w\.]+) import", content, re.MULTILINE)
-        module_name = "/".join(py_file.relative_to(project_root).parts)[:-3]
-        print(f"module_name={module_name}")
-        for imp in imports:
-            # Convert dotted path to slash path: utils.spark.modules.logger → utils/spark/modules/logger
-            target_name = imp.replace(".", "/")
-            edges.append((module_name, target_name))
-    print(f"edges={edges}")
-    return edges
-
-def build_dependency_graph(edges: list[tuple[str, str]]):
-    with driver.session() as session:
-        # Create constraint once
-        session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (m:Module) REQUIRE m.name IS UNIQUE")
-        
-        # for source, target in edges:
-        #     session.run("""
-        #         MERGE (a:Module {name: $source})
-        #         MERGE (b:Module {name: $target})
-        #         MERGE (a)-[:DEPENDS_ON]->(b)
-        #     """, source=source, target=target)
+SKIP_DIRS = {"__pycache__", "venv", ".venv", "node_modules", "build", "dist", ".git"}
 
 
-        for source, target in edges:
-            source_label = "InternalModule" if "/" in source else "ExternalPackage"
-            target_label = "InternalModule" if "/" in target else "ExternalPackage"
-            session.run(f"""
-                MERGE (a:{source_label} {{name: $source}})
-                MERGE (b:{target_label} {{name: $target}})
-                MERGE (a)-[:DEPENDS_ON]->(b)
-            """, source=source, target=target)
+def _skip(rel: Path) -> bool:
+    """Skip hidden dirs and common non-source dirs."""
+    return any(part in SKIP_DIRS or part.startswith(".") for part in rel.parts)
 
 
-# Run in CI
+def extract_graph(project_root: str):
+    """Scan the project and return (modules, edges).
+
+    modules: {module_name: (file_path, docstring)}   module_name uses '/' form
+    edges:   [(source, target)]  unique import relationships
+    """
+    root = Path(project_root)
+    modules: dict[str, tuple[str, str]] = {}
+    edge_set: set[tuple[str, str]] = set()
+
+    for py in root.rglob("*.py"):
+        if _skip(py.relative_to(root)):
+            continue
+        parts = list(py.with_suffix("").relative_to(root).parts)
+        if parts and parts[-1] == "__init__":      # a/b/__init__.py -> a/b
+            parts = parts[:-1]
+        name = "/".join(parts)
+        if not name:
+            continue
+
+        try:
+            tree = ast.parse(py.read_text(encoding="utf-8", errors="ignore"), filename=str(py))
+        except (SyntaxError, ValueError):
+            continue                                 # unparseable file: skip, keep going
+        modules[name] = (str(py), ast.get_docstring(tree) or "")
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    edge_set.add((name, alias.name.replace(".", "/")))
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                edge_set.add((name, node.module.replace(".", "/")))
+
+    return modules, list(edge_set)
+
+
+def load_graph(modules: dict, edges: list, uri: str, auth: tuple) -> int:
+    """Bulk-load nodes + relationships. Idempotent: safe to re-run in CI."""
+    internal = set(modules)
+    rels_int, rels_ext, external = [], [], set()
+    for src, tgt in edges:
+        if tgt in internal:                          # internal -> internal edge
+            rels_int.append({"s": src, "t": tgt})
+        else:                                        # internal -> external edge
+            external.add(tgt)
+            rels_ext.append({"s": src, "t": tgt})
+
+    with GraphDatabase.driver(uri, auth=auth) as driver:
+        driver.verify_connectivity()
+        with driver.session() as session:
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (m:InternalModule) REQUIRE m.name IS UNIQUE")
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (m:ExternalPackage) REQUIRE m.name IS UNIQUE")
+
+            if modules:
+                session.run(
+                    "UNWIND $rows AS r MERGE (m:InternalModule {name: r.name}) "
+                    "SET m.path = r.path, m.doc = r.doc",
+                    rows=[{"name": n, "path": p, "doc": d} for n, (p, d) in modules.items()],
+                )
+            if external:
+                session.run(
+                    "UNWIND $rows AS r MERGE (e:ExternalPackage {name: r.name})",
+                    rows=[{"name": n} for n in external],
+                )
+            if rels_int:
+                session.run(
+                    "UNWIND $rows AS r MERGE (a:InternalModule {name: r.s}) "
+                    "MERGE (b:InternalModule {name: r.t}) MERGE (a)-[:DEPENDS_ON]->(b)",
+                    rows=rels_int,
+                )
+            if rels_ext:
+                session.run(
+                    "UNWIND $rows AS r MERGE (a:InternalModule {name: r.s}) "
+                    "MERGE (b:ExternalPackage {name: r.t}) MERGE (a)-[:DEPENDS_ON]->(b)",
+                    rows=rels_ext,
+                )
+    return len(edges)
+
+
 if __name__ == "__main__":
-    path_src="/Users/mk/code/rcaf-data-platform-artifacts/" #"src/"
-    edges = extract_module_dependencies(path_src)
-    build_dependency_graph(edges)
-    print(f"✅ Inserted {len(edges)} dependency edges into DKG")
-
+    root = sys.argv[1] if len(sys.argv) > 1 else "."
+    modules, edges = extract_graph(root)
+    uri = os.getenv("NEO4J_URI", "neo4j://localhost:7687")
+    auth = (os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", "password"))
+    total = load_graph(modules, edges, uri, auth)
+    print(f"Loaded {len(modules)} modules and {total} dependency edges into Neo4j")

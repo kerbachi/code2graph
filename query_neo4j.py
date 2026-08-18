@@ -1,66 +1,73 @@
 #!/usr/bin/env python3
-"""Diagnostic script to query the Neo4j dependency graph."""
+"""Explore the Neo4j codebase dependency graph.
+
+Usage:
+    python query_neo4j.py                 # graph stats + sample
+    python query_neo4j.py <module_name>   # explore one module (e.g. utils/spark/io)
+"""
+import os
+import sys
+
 from neo4j import GraphDatabase
 
-URI = "neo4j://localhost:7687"
-AUTH = ("neo4j", "your_password")  # update with your actual password
+URI = os.getenv("NEO4J_URI", "neo4j://localhost:7687")
+AUTH = (os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", "password"))
+
+
+def run(session, query, **params):
+    return [dict(r) for r in session.run(query, **params)]
+
+
+def explore_module(session, name: str):
+    """Impact analysis: what this module imports, what imports it, and its docstring."""
+    rows = run(session,
+        "MATCH (m:InternalModule) WHERE m.name = $n OR m.name STARTS WITH $n + '/' "
+        "RETURN m.name AS name, m.doc AS doc, m.path AS path ORDER BY name", n=name)
+    if not rows:
+        print(f"No module matching '{name}'. Try one of the names below:")
+        for r in run(session, "MATCH (m:InternalModule) RETURN m.name AS name ORDER BY name LIMIT 25"):
+            print(f"  - {r['name']}")
+        return
+    for r in rows:
+        print(f"\n== {r['name']}  ({r['path']})")
+        print(f"   doc: {r['doc'] or '(no docstring)'}")
+        deps = run(session,
+            "MATCH (a:InternalModule {name: $n})-[:DEPENDS_ON]->(b) "
+            "RETURN b.name AS dep ORDER BY dep", n=r["name"])
+        print(f"   imports: {[d['dep'] for d in deps] or '(none)'}")
+        who = run(session,
+            "MATCH (a:InternalModule)-[:DEPENDS_ON]->(b:InternalModule {name: $n}) "
+            "RETURN a.name AS user ORDER BY user", n=r["name"])
+        print(f"   used by: {[u['user'] for u in who] or '(none - top level)'}")
+
+
+def stats(session):
+    total = run(session, "MATCH (m:InternalModule) RETURN count(m) AS c")[0]["c"]
+    pkgs = run(session, "MATCH (p:ExternalPackage) RETURN count(p) AS c")[0]["c"]
+    edges = run(session, "MATCH ()-[r:DEPENDS_ON]->() RETURN count(r) AS c")[0]["c"]
+    print(f"Graph: {total} internal modules, {pkgs} external packages, {edges} dependency edges")
+
+    print("\nMost-depended-on internal modules (highest fan-in = most 'load-bearing'):")
+    for r in run(session,
+        "MATCH (a:InternalModule)-[:DEPENDS_ON]->(b:InternalModule) "
+        "RETURN b.name AS name, count(a) AS users ORDER BY users DESC LIMIT 5"):
+        print(f"  {r['users']:>3}  {r['name']}")
+
+    print("\nTop external packages by number of modules importing them:")
+    for r in run(session,
+        "MATCH (a:InternalModule)-[:DEPENDS_ON]->(p:ExternalPackage) "
+        "RETURN p.name AS name, count(a) AS users ORDER BY users DESC LIMIT 5"):
+        print(f"  {r['users']:>3}  {r['name']}")
+
 
 def main():
-    try:
-        with GraphDatabase.driver(URI, auth=AUTH) as driver:
-            # Test connection
-            driver.verify_connectivity()
-            print("✅ Connected to Neo4j successfully!\n")
-            
-            with driver.session() as session:
-                # 1. Total node count
-                result = session.run("MATCH (m:Module) RETURN count(m) AS total_nodes")
-                row = result.single()
-                print(f"Total Module nodes: {row['total_nodes']}\n")
-                
-                # 2. Find nodes containing 'iceberg'
-                result = session.run(
-                    "MATCH (m:Module) WHERE m.name CONTAINS 'iceberg' RETURN m.name AS name ORDER BY name"
-                )
-                iceberg_nodes = [r["name"] for r in result]
-                print(f"Nodes containing 'iceberg': {iceberg_nodes}\n")
-                
-                # 3. If found, show its dependencies
-                if iceberg_nodes:
-                    for name in iceberg_nodes:
-                        result = session.run(
-                            "MATCH (a:Module {name: $n})-[:DEPENDS_ON]->(b:Module) RETURN b.name AS dependency ORDER BY b.name",
-                            n=name
-                        )
-                        deps = [r["dependency"] for r in result]
-                        print(f"'{name}' depends on: {deps}")
-                    
-                    # Show reverse: who depends on iceberg
-                    for name in iceberg_nodes:
-                        result = session.run(
-                            "MATCH (a:Module)-[:DEPENDS_ON]->(b:Module {name: $n}) RETURN a.name AS dependent ORDER BY a.name",
-                            n=name
-                        )
-                        dependents = [r["dependent"] for r in result]
-                        print(f"Who depends on '{name}': {dependents}")
-                else:
-                    print("❌ No 'iceberg' node found. Listing all unique module names for reference:")
-                    result = session.run(
-                        "MATCH (m:Module) RETURN DISTINCT m.name AS name ORDER BY name LIMIT 50"
-                    )
-                    for r in result:
-                        print(f"  - {r['name']}")
-                
-                # 4. Sample some edges to verify graph structure
-                result = session.run(
-                    "MATCH (a:Module)-[r:DEPENDS_ON]->(b:Module) RETURN a.name AS source, b.name AS target LIMIT 10"
-                )
-                print("\nSample edges:")
-                for r in result:
-                    print(f"  {r['source']} -> {r['target']}")
-                    
-    except Exception as e:
-        print(f"❌ Error: {e}")
+    with GraphDatabase.driver(URI, auth=AUTH) as driver:
+        driver.verify_connectivity()
+        with driver.session() as session:
+            stats(session)
+            if len(sys.argv) > 1:
+                explore_module(session, sys.argv[1])
+
 
 if __name__ == "__main__":
     main()
