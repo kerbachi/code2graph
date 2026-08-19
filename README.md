@@ -1,13 +1,13 @@
-# Codebase Graph — Python Dependency Graph in Neo4j
+# Codebase Graph — Multi-Repo Python Dependency Graph in Neo4j
 
-Turn your Python codebase into a queryable dependency graph in Neo4j. Answer "who depends on what" in seconds, and give an AI the precise modules, file paths, and docstrings behind a feature — for RAG, impact analysis, and onboarding.
+Turn your team's Python codebases (multiple repos + internal libraries) into a single queryable dependency graph in Neo4j. Answer "who depends on what" in seconds, and give an AI the precise modules, file paths, docstrings, and **owning repo** behind a feature — for RAG, impact analysis, and onboarding.
 
 ## Introduction
 
-This repository contains a small pipeline for turning a Python codebase into a Neo4j dependency graph:
+This repository contains a small pipeline for turning Python codebases into a Neo4j dependency graph. It is **repo-aware**: you run it once per repository, and each run tags every module with its owning repo, so modules from different repos coexist without collisions and cross-repo dependencies are captured.
 
-- **`main.py`** — scans a project's Python imports (via `ast`) and loads modules, packages, and `DEPENDS_ON` relationships into Neo4j
-- **`query_neo4j.py`** — explores the graph: stats, impact analysis, and module lookups for RAG context
+- **`main.py`** — scans a project's Python imports (via `ast`) and loads modules, packages, repos, and `DEPENDS_ON` relationships into Neo4j
+- **`query_neo4j.py`** — explores the graph: stats, impact analysis, cross-repo lookups, and module searches for RAG context
 - **`docker-compose.yml`** — starts a local Neo4j instance for running the pipeline
 
 ## Quickstart
@@ -15,44 +15,59 @@ This repository contains a small pipeline for turning a Python codebase into a N
 ```bash
 docker compose up -d                      # start Neo4j (neo4j/password)
 pip install -r requirements.txt
-python main.py /path/to/your/codebase     # load the graph
-python query_neo4j.py                     # stats + top modules
+
+# Load each repo separately - the repo name is the folder's basename
+python main.py /path/to/repoA
+python main.py /path/to/repoB
+python main.py /path/to/repoC
+
+# Explore
+python query_neo4j.py                     # overall stats + top modules
+python query_neo4j.py --repo repoA        # stats for one repo
+python query_neo4j.py --who-uses acme_common/http   # who imports a library module
 python query_neo4j.py utils/spark/io      # impact analysis for one module
 ```
+
+> **Order matters for cross-repo edges.** When repoA imports a module from repoB, the cross-repo edge is created when repoB is loaded *after* repoA (the loader upgrades stale `ExternalPackage` edges). For best results, load library repos first, then the repos that consume them. Re-running any repo is safe and idempotent.
 
 ## Graph Schema
 
 ```
-:InternalModule -[:DEPENDS_ON]-> :InternalModule     (intra-codebase import)
-:InternalModule -[:DEPENDS_ON]-> :ExternalPackage     (imports a lib / stdlib)
+(:Repository)-[:CONTAINS]->(:InternalModule)
+(:InternalModule)-[:DEPENDS_ON]->(:InternalModule)     # within-repo AND cross-repo
+(:InternalModule)-[:DEPENDS_ON]->(:ExternalPackage)    # true third-party / stdlib
 ```
 
 | Label | Represents | Example |
 |---|---|---|
-| `:InternalModule` | Your project's Python modules (relative file paths) | `utils/spark/io/file_reader` |
-| `:ExternalPackage` | Imported dependencies (standard library + third-party) | `sys`, `boto3`, `pyspark` |
+| `:Repository` | A scanned codebase (folder basename) | `acme-common`, `billing-service` |
+| `:InternalModule` | A Python module, tagged with its owning repo | `{repo: 'acme-common', name: 'http/client'}` |
+| `:ExternalPackage` | Imported dependencies (stdlib + third-party) | `sys`, `boto3`, `pyspark` |
 
-An import target is classified **internal** only if it resolves to a real module
-in the scanned project - this is what enables the internal→internal edges that
-make "who depends on X" impact queries possible.
+An import target is classified **internal** if it resolves to a module in *any* loaded repo — this is what enables cross-repo edges and "who uses this library" queries.
 
 ## Node Properties
 
 | Node | Property | Type | Example |
 |---|---|---|---|
-| `:InternalModule` | `name` | `STRING` | `utils/spark/io/file_reader` |
-| `:InternalModule` | `path` | `STRING` | `/repo/utils/spark/io/file_reader.py` |
+| `:Repository` | `name` | `STRING` | `acme-common` |
+| `:Repository` | `path` | `STRING` | `/code/acme-common` |
+| `:Repository` | `git_remote` | `STRING` | `git@github.com:org/acme-common.git` (optional) |
+| `:Repository` | `git_commit` | `STRING` | `abc123...` (optional) |
+| `:Repository` | `loaded_at` | `DATETIME` | last load time |
+| `:InternalModule` | `repo` | `STRING` | `acme-common` |
+| `:InternalModule` | `name` | `STRING` | `http/client` |
+| `:InternalModule` | `path` | `STRING` | `/code/acme-common/http/client.py` |
 | `:InternalModule` | `doc` | `STRING` | module docstring (RAG context for the LLM) |
 | `:ExternalPackage` | `name` | `STRING` | `boto3` |
 
-> `path` and `doc` on `:InternalModule` are what make this useful for RAG: the
-> LLM can pull a module's docstring and file location to answer "where is X
-> implemented?" and "what does module Y do?"
+> `repo`, `path`, and `doc` on `:InternalModule` are what make this useful for RAG: the LLM can pull a module's docstring, file location, **and owning repo** to answer "where is X implemented?" and "which repo provides library Y?"
 
 ## Relationship Properties
 
 | Type | Direction | Meaning |
 |---|---|---|
+| `[:CONTAINS]` | Repository → InternalModule | This repo contains this module |
 | `[:DEPENDS_ON]` | InternalModule → InternalModule / ExternalPackage | This module imports that module/package |
 
 ---
@@ -62,11 +77,11 @@ make "who depends on X" impact queries possible.
 ### 1. Explore Nodes
 
 ```cypher
-// List all internal modules
-MATCH (m:InternalModule) RETURN m.name AS name ORDER BY name;
+// List all repos
+MATCH (r:Repository) RETURN r.name AS repo, r.path AS path ORDER BY repo;
 
-// List all external packages
-MATCH (p:ExternalPackage) RETURN p.name AS name ORDER BY name;
+// List all internal modules in one repo
+MATCH (m:InternalModule {repo: 'acme-common'}) RETURN m.name AS name ORDER BY name;
 
 // Count nodes by type
 MATCH (n) RETURN labels(n) AS label, count(n) AS count ORDER BY count DESC;
@@ -75,57 +90,66 @@ MATCH (n) RETURN labels(n) AS label, count(n) AS count ORDER BY count DESC;
 ### 2. Find Dependencies of a Module
 
 ```cypher
-// All dependencies of a module (internal modules + external packages)
-MATCH (m:InternalModule {name: 'utils/spark/io/file_reader'})-[:DEPENDS_ON]->(dep)
-RETURN dep.name AS dependency, labels(dep) AS type ORDER BY dep.name;
+// All dependencies of a module (internal + external), with owning repo
+MATCH (m:InternalModule {repo: 'billing-service', name: 'utils/spark/io/file_reader'})-[:DEPENDS_ON]->(dep)
+RETURN dep.name AS dependency, labels(dep) AS type, dep.repo AS repo ORDER BY dep.name;
 
 // All external packages imported by a module
-MATCH (m:InternalModule {name: 'utils/spark/io/file_reader'})-[:DEPENDS_ON]->(p:ExternalPackage)
+MATCH (m:InternalModule {repo: 'billing-service', name: 'utils/spark/io/file_reader'})-[:DEPENDS_ON]->(p:ExternalPackage)
 RETURN p.name AS dependency ORDER BY p.name;
-
-// Dependencies of all modules matching a pattern
-MATCH (m:InternalModule)-[:DEPENDS_ON]->(dep)
-WHERE m.name STARTS WITH 'utils/spark/io'
-RETURN m.name AS module, collect(dep.name) AS dependencies;
 ```
 
-### 3. Find Who Uses a Package
+### 3. Cross-Repo: Which Repos Use a Library?
 
 ```cypher
-// Which modules import a specific package?
+// Which repos import modules from repo 'acme-common'?
+MATCH (a:InternalModule)-[:DEPENDS_ON]->(b:InternalModule {repo: 'acme-common'})
+RETURN a.repo AS consumer_repo, count(DISTINCT a) AS modules_using
+ORDER BY modules_using DESC;
+
+// Which specific modules of 'acme-common' are most reused across the org?
+MATCH (a:InternalModule)-[:DEPENDS_ON]->(b:InternalModule {repo: 'acme-common'})
+RETURN b.name AS library_module, count(DISTINCT a) AS users
+ORDER BY users DESC LIMIT 10;
+
+// Which repos does 'billing-service' depend on internally?
+MATCH (a:InternalModule {repo: 'billing-service'})-[:DEPENDS_ON]->(b:InternalModule)
+WHERE b.repo <> 'billing-service'
+RETURN DISTINCT b.repo AS internal_dependency;
+```
+
+### 4. Find Who Uses a Package
+
+```cypher
+// Which modules import a specific external package?
 MATCH (m:InternalModule)-[:DEPENDS_ON]->(p:ExternalPackage {name: 'boto3'})
-RETURN m.name AS module ORDER BY m.name;
+RETURN m.repo AS repo, m.name AS module ORDER BY repo, module;
 
 // Which modules import any of a set of packages?
 MATCH (m:InternalModule)-[:DEPENDS_ON]->(p:ExternalPackage)
 WHERE p.name IN ['boto3', 'pyspark', 'yaml']
-RETURN p.name AS package, collect(m.name) AS modules;
+RETURN p.name AS package, collect(m.repo + '/' + m.name) AS modules;
 ```
 
-### 4. Find Common Dependencies
+### 5. Find Common Dependencies
 
 ```cypher
-// Packages used by multiple modules
+// External packages used by multiple modules
 MATCH (m:InternalModule)-[:DEPENDS_ON]->(p:ExternalPackage)
 RETURN p.name AS package, count(m) AS usage_count
 ORDER BY usage_count DESC LIMIT 10;
-```
 
-### 5. Find Orphaned / Unused Nodes
-
-```cypher
-// External packages with no incoming dependencies (isolated)
-MATCH (p:ExternalPackage)
-WHERE NOT (p)<-[:DEPENDS_ON]-()
-RETURN p.name;
-
-// (Should return empty if graph is correctly populated)
+// Internal modules used across multiple repos (the org's shared libraries)
+MATCH (a:InternalModule)-[:DEPENDS_ON]->(b:InternalModule)
+WHERE a.repo <> b.repo
+RETURN b.repo AS library_repo, b.name AS module, count(DISTINCT a.repo) AS repos_using
+ORDER BY repos_using DESC LIMIT 10;
 ```
 
 ### 6. Path Analysis
 
 ```cypher
-// Full dependency chain (if internal modules also depend on other internal modules)
+// Full dependency chain (within and across repos)
 MATCH path = (a:InternalModule)-[:DEPENDS_ON*1..3]->(b)
 WHERE a.name CONTAINS 'file_reader'
 RETURN path;
@@ -134,21 +158,17 @@ RETURN path;
 ### 7. RAG: Locate & Describe a Feature (the LLM's job)
 
 ```cypher
-// Pull a module's docstring + file path to feed an LLM
+// Pull a module's docstring + file path + repo to feed an LLM
 MATCH (m:InternalModule)
 WHERE m.name CONTAINS 'file_reader'
-RETURN m.name AS module, m.doc AS doc, m.path AS path;
+RETURN m.repo AS repo, m.name AS module, m.doc AS doc, m.path AS path;
 
 // What does a module touch? (context to give the LLM before it reads code)
-MATCH (m:InternalModule {name: 'utils/spark/io/file_reader'})-[:DEPENDS_ON]->(dep)
-RETURN dep.name AS dependency, labels(dep) AS type;
+MATCH (m:InternalModule {repo: 'billing-service', name: 'utils/spark/io/file_reader'})-[:DEPENDS_ON]->(dep)
+RETURN dep.name AS dependency, labels(dep) AS type, dep.repo AS repo;
 ```
 
-**How this feeds RAG:** given a user question like *"where are Iceberg files
-read?"*, an LLM (or vector search over the `doc` property) identifies the
-candidate modules, then the graph expands the neighborhood (`-[:DEPENDS_ON]->`)
-so the LLM gets *exact* file paths and imports to retrieve — rather than
-guessing. The graph turns "fuzzy" questions into precise files to read.
+**How this feeds RAG:** given a user question like *"where are Iceberg files read?"*, an LLM (or vector search over the `doc` property) identifies the candidate modules, then the graph expands the neighborhood (`-[:DEPENDS_ON]->`) so the LLM gets *exact* file paths, imports, **and owning repos** to retrieve — rather than guessing. The graph turns "fuzzy" questions into precise files to read, and tells the developer *which repo* provides a reusable library.
 
 ### 8. Graph Statistics
 
@@ -159,11 +179,15 @@ MATCH ()-[r]->() RETURN count(r) AS total_relationships;
 
 // Most dependent module (imports most packages)
 MATCH (m:InternalModule)-[:DEPENDS_ON]->(p:ExternalPackage)
-RETURN m.name AS module, count(p) AS dep_count
+RETURN m.repo AS repo, m.name AS module, count(p) AS dep_count
 ORDER BY dep_count DESC LIMIT 5;
 
-// Most popular package (used by most modules)
+// Most popular external package (used by most modules)
 MATCH (m:InternalModule)-[:DEPENDS_ON]->(p:ExternalPackage)
 RETURN p.name AS package, count(m) AS user_count
 ORDER BY user_count DESC LIMIT 10;
-```
+
+// Cross-repo dependency count
+MATCH (a:InternalModule)-[:DEPENDS_ON]->(b:InternalModule)
+WHERE a.repo <> b.repo
+RETURN count(*) AS cross_repo_edges;
