@@ -8,6 +8,7 @@ This repository contains a small pipeline for turning Python codebases into a Ne
 
 - **`main.py`** — scans a project's Python imports (via `ast`) and loads modules, packages, repos, and `DEPENDS_ON` relationships into Neo4j
 - **`query_neo4j.py`** — explores the graph: stats, impact analysis, cross-repo lookups, and module searches for RAG context
+- **`llm_query.py`** — asks natural language questions about the codebase; uses an LLM to generate Cypher queries and displays results
 - **`docker-compose.yml`** — starts a local Neo4j instance for running the pipeline
 
 ## Quickstart
