@@ -24,9 +24,39 @@ python main.py /path/to/repoC
 # Explore
 python query_neo4j.py                     # overall stats + top modules
 python query_neo4j.py --repo repoA        # stats for one repo
-python query_neo4j.py --who-uses acme_common/http   # who imports a library module
-python query_neo4j.py utils/spark/io      # impact analysis for one module
+python query_neo4j.py --who-uses neomodel/async_/node   # who imports a library module
+python query_neo4j.py neomodel/async_/node      # impact analysis for one module
 ```
+
+## LLM Natural Language Query
+
+Ask questions about your codebase in plain English. The `llm_query.py` script uses an OpenAI-compatible
+API to convert your question into a Cypher query, executes it against Neo4j, and displays the results.
+
+```bash
+# Install the OpenAI Python client
+pip install -r requirements.txt
+
+# Ask natural language questions (requires an LLM API: OpenAI, Ollama, vLLM, etc.)
+python llm_query.py "Which modules import pytest?"
+python llm_query.py "Show me all dependencies of neomodel/async_/node"
+python llm_query.py "Which repos depend on neomodel?"
+```
+
+**Configuration** (via environment variables):
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_API_URL` | `http://localhost:11434/v1` | OpenAI-compatible API endpoint |
+| `LLM_API_KEY` | `ollama` | API key |
+| `LLM_MODEL` | `gpt-4o` | Model name |
+| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection string |
+| `NEO4J_USER` | `neo4j` | Neo4j username |
+| `NEO4J_PASSWORD` | `password` | Neo4j password |
+
+**How it works:** The script injects the graph schema and example question→Cypher mappings into the LLM's
+system prompt. This teaches the LLM your specific schema so it can accurately translate natural language
+questions into valid Cypher queries — no fine-tuning required.
 
 > **Order matters for cross-repo edges.** When repoA imports a module from repoB, the cross-repo edge is created when repoB is loaded *after* repoA (the loader upgrades stale `ExternalPackage` edges). For best results, load library repos first, then the repos that consume them. Re-running any repo is safe and idempotent.
 
@@ -40,9 +70,9 @@ python query_neo4j.py utils/spark/io      # impact analysis for one module
 
 | Label | Represents | Example |
 |---|---|---|
-| `:Repository` | A scanned codebase (folder basename) | `acme-common`, `billing-service` |
-| `:InternalModule` | A Python module, tagged with its owning repo | `{repo: 'acme-common', name: 'http/client'}` |
-| `:ExternalPackage` | Imported dependencies (stdlib + third-party) | `sys`, `boto3`, `pyspark` |
+| `:Repository` | A scanned codebase (folder basename) | `code2graph`, `neomodel` |
+| `:InternalModule` | A Python module, tagged with its owning repo | `{repo: 'neomodel', name: 'neomodel/async_/node'}` |
+| `:ExternalPackage` | Imported dependencies (stdlib + third-party) | `pytest`, `typing`, `__future__` |
 
 An import target is classified **internal** if it resolves to a module in *any* loaded repo — this is what enables cross-repo edges and "who uses this library" queries.
 
@@ -50,16 +80,16 @@ An import target is classified **internal** if it resolves to a module in *any* 
 
 | Node | Property | Type | Example |
 |---|---|---|---|
-| `:Repository` | `name` | `STRING` | `acme-common` |
-| `:Repository` | `path` | `STRING` | `/code/acme-common` |
-| `:Repository` | `git_remote` | `STRING` | `git@github.com:org/acme-common.git` (optional) |
-| `:Repository` | `git_commit` | `STRING` | `abc123...` (optional) |
+| `:Repository` | `name` | `STRING` | `code2graph` |
+| `:Repository` | `path` | `STRING` | `/Users/mk/code/code2graph` |
+| `:Repository` | `git_remote` | `STRING` | `https://github.com/kerbachi/code2graph.git` (optional) |
+| `:Repository` | `git_commit` | `STRING` | `392b9668a47cd1e9034328484aad41c7358725cd` (optional) |
 | `:Repository` | `loaded_at` | `DATETIME` | last load time |
-| `:InternalModule` | `repo` | `STRING` | `acme-common` |
-| `:InternalModule` | `name` | `STRING` | `http/client` |
-| `:InternalModule` | `path` | `STRING` | `/code/acme-common/http/client.py` |
+| `:InternalModule` | `repo` | `STRING` | `neomodel` |
+| `:InternalModule` | `name` | `STRING` | `neomodel/async_/node` |
+| `:InternalModule` | `path` | `STRING` | `/Users/mk/code/neomodel/neomodel/async_/node.py` |
 | `:InternalModule` | `doc` | `STRING` | module docstring (RAG context for the LLM) |
-| `:ExternalPackage` | `name` | `STRING` | `boto3` |
+| `:ExternalPackage` | `name` | `STRING` | `pytest` |
 
 > `repo`, `path`, and `doc` on `:InternalModule` are what make this useful for RAG: the LLM can pull a module's docstring, file location, **and owning repo** to answer "where is X implemented?" and "which repo provides library Y?"
 
@@ -81,7 +111,7 @@ An import target is classified **internal** if it resolves to a module in *any* 
 MATCH (r:Repository) RETURN r.name AS repo, r.path AS path ORDER BY repo;
 
 // List all internal modules in one repo
-MATCH (m:InternalModule {repo: 'acme-common'}) RETURN m.name AS name ORDER BY name;
+MATCH (m:InternalModule {repo: 'neomodel'}) RETURN m.name AS name ORDER BY name;
 
 // Count nodes by type
 MATCH (n) RETURN labels(n) AS label, count(n) AS count ORDER BY count DESC;
@@ -91,30 +121,30 @@ MATCH (n) RETURN labels(n) AS label, count(n) AS count ORDER BY count DESC;
 
 ```cypher
 // All dependencies of a module (internal + external), with owning repo
-MATCH (m:InternalModule {repo: 'billing-service', name: 'utils/spark/io/file_reader'})-[:DEPENDS_ON]->(dep)
+MATCH (m:InternalModule {repo: 'neomodel', name: 'neomodel/async_/node'})-[:DEPENDS_ON]->(dep)
 RETURN dep.name AS dependency, labels(dep) AS type, dep.repo AS repo ORDER BY dep.name;
 
 // All external packages imported by a module
-MATCH (m:InternalModule {repo: 'billing-service', name: 'utils/spark/io/file_reader'})-[:DEPENDS_ON]->(p:ExternalPackage)
+MATCH (m:InternalModule {repo: 'neomodel', name: 'neomodel/async_/node'})-[:DEPENDS_ON]->(p:ExternalPackage)
 RETURN p.name AS dependency ORDER BY p.name;
 ```
 
 ### 3. Cross-Repo: Which Repos Use a Library?
 
 ```cypher
-// Which repos import modules from repo 'acme-common'?
-MATCH (a:InternalModule)-[:DEPENDS_ON]->(b:InternalModule {repo: 'acme-common'})
+// Which repos import modules from repo 'neo4j-python-driver'?
+MATCH (a:InternalModule)-[:DEPENDS_ON]->(b:InternalModule {repo: 'neo4j-python-driver'})
 RETURN a.repo AS consumer_repo, count(DISTINCT a) AS modules_using
 ORDER BY modules_using DESC;
 
-// Which specific modules of 'acme-common' are most reused across the org?
-MATCH (a:InternalModule)-[:DEPENDS_ON]->(b:InternalModule {repo: 'acme-common'})
+// Which specific modules of 'neo4j-python-driver' are most reused across the org?
+MATCH (a:InternalModule)-[:DEPENDS_ON]->(b:InternalModule {repo: 'neo4j-python-driver'})
 RETURN b.name AS library_module, count(DISTINCT a) AS users
 ORDER BY users DESC LIMIT 10;
 
-// Which repos does 'billing-service' depend on internally?
-MATCH (a:InternalModule {repo: 'billing-service'})-[:DEPENDS_ON]->(b:InternalModule)
-WHERE b.repo <> 'billing-service'
+// Which repos does 'neomodel' depend on internally?
+MATCH (a:InternalModule {repo: 'neomodel'})-[:DEPENDS_ON]->(b:InternalModule)
+WHERE b.repo <> 'neomodel'
 RETURN DISTINCT b.repo AS internal_dependency;
 ```
 
@@ -122,12 +152,12 @@ RETURN DISTINCT b.repo AS internal_dependency;
 
 ```cypher
 // Which modules import a specific external package?
-MATCH (m:InternalModule)-[:DEPENDS_ON]->(p:ExternalPackage {name: 'boto3'})
+MATCH (m:InternalModule)-[:DEPENDS_ON]->(p:ExternalPackage {name: 'pytest'})
 RETURN m.repo AS repo, m.name AS module ORDER BY repo, module;
 
 // Which modules import any of a set of packages?
 MATCH (m:InternalModule)-[:DEPENDS_ON]->(p:ExternalPackage)
-WHERE p.name IN ['boto3', 'pyspark', 'yaml']
+WHERE p.name IN ['pytest', '__future__', 'typing']
 RETURN p.name AS package, collect(m.repo + '/' + m.name) AS modules;
 ```
 
@@ -151,7 +181,7 @@ ORDER BY repos_using DESC LIMIT 10;
 ```cypher
 // Full dependency chain (within and across repos)
 MATCH path = (a:InternalModule)-[:DEPENDS_ON*1..3]->(b)
-WHERE a.name CONTAINS 'file_reader'
+WHERE a.name CONTAINS 'async_/node'
 RETURN path;
 ```
 
@@ -160,11 +190,11 @@ RETURN path;
 ```cypher
 // Pull a module's docstring + file path + repo to feed an LLM
 MATCH (m:InternalModule)
-WHERE m.name CONTAINS 'file_reader'
+WHERE m.name CONTAINS 'async_/node'
 RETURN m.repo AS repo, m.name AS module, m.doc AS doc, m.path AS path;
 
 // What does a module touch? (context to give the LLM before it reads code)
-MATCH (m:InternalModule {repo: 'billing-service', name: 'utils/spark/io/file_reader'})-[:DEPENDS_ON]->(dep)
+MATCH (m:InternalModule {repo: 'neomodel', name: 'neomodel/async_/node'})-[:DEPENDS_ON]->(dep)
 RETURN dep.name AS dependency, labels(dep) AS type, dep.repo AS repo;
 ```
 
