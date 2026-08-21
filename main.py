@@ -80,6 +80,8 @@ def extract_graph(project_root: str):
         if _skip(py.relative_to(root)):
             continue
         parts = list(py.with_suffix("").relative_to(root).parts)
+        if parts and parts[0] == "src":            # src/ layout: strip leading src/
+            parts = parts[1:]
         if parts and parts[-1] == "__init__":      # a/b/__init__.py -> a/b
             parts = parts[:-1]
         name = "/".join(parts)
